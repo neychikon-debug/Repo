@@ -1,258 +1,277 @@
-#!/bin/bash
-# =============================================================================
-#  MTProto Proxy — автоустановка с FakeTLS (обход DPI в России)
-#  Образ: nineseconds/mtg:2  |  Маскировка: HTTPS к популярному домену
-# =============================================================================
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║              MTProto Proxy — Docker Auto-Setup Script                   ║
+# ║  Автоматически определяет IP, задаёт порт, разворачивает контейнер      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
 
-# ─── Цвета ───────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  ЦВЕТА
+# ──────────────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
-NC='\033[0m'
+RESET='\033[0m'
 
-# ─── Параметры по умолчанию ──────────────────────────────────────────────────
-CONTAINER_NAME="mtproto-proxy"
-PORT="${MTPROTO_PORT:-443}"
-FAKE_DOMAIN="${MTPROTO_DOMAIN:-www.google.com}"
-IMAGE="nineseconds/mtg:2"
-CONFIG_FILE="$HOME/mtproto_config.txt"
+log()     { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+header()  { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}\n"; }
 
-# ─── Хелперы вывода ──────────────────────────────────────────────────────────
-info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()     { echo -e "${RED}[ERR]${NC}   $*" >&2; }
-banner()  { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════${NC}"; \
-            echo -e "${BOLD}${BLUE}  $*${NC}"; \
-            echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
+# ──────────────────────────────────────────────────────────────────────────────
+#  КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ (можно переопределить переменными окружения)
+# ──────────────────────────────────────────────────────────────────────────────
+CONTAINER_NAME="${CONTAINER_NAME:-mtproto-proxy}"
+IMAGE="${IMAGE:-telegrammessenger/proxy:latest}"
+PROXY_PORT="${PROXY_PORT:-}"          # если пусто — спросим у пользователя
+SECRET="${SECRET:-}"                  # если пусто — сгенерируем
+TAG="${TAG:-dd}"                      # dd = защита от DPI (рекомендуется)
+STATS_PORT="${STATS_PORT:-8888}"
+RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
 
-# ─── Баннер ──────────────────────────────────────────────────────────────────
-clear
-echo -e "${BOLD}${CYAN}"
-cat << 'LOGO'
-  ███╗   ███╗████████╗██████╗ ██████╗  ██████╗ ████████╗ ██████╗
-  ████╗ ████║╚══██╔══╝██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝██╔═══██╗
-  ██╔████╔██║   ██║   ██████╔╝██████╔╝██║   ██║   ██║   ██║   ██║
-  ██║╚██╔╝██║   ██║   ██╔═══╝ ██╔══██╗██║   ██║   ██║   ██║   ██║
-  ██║ ╚═╝ ██║   ██║   ██║     ██║  ██║╚██████╔╝   ██║   ╚██████╔╝
-  ╚═╝     ╚═╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝
-         Telegram MTProto Proxy  |  FakeTLS  |  Docker
-LOGO
-echo -e "${NC}"
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПРОВЕРКА ЗАВИСИМОСТЕЙ
+# ──────────────────────────────────────────────────────────────────────────────
+check_deps() {
+  header "Проверка зависимостей"
+  local missing=()
 
-# ─── 1. Проверка root ────────────────────────────────────────────────────────
-banner "Шаг 1/6: Проверка окружения"
-
-if [[ $EUID -ne 0 ]]; then
-  warn "Запущен без root. Команды docker будут вызваны через sudo."
-  SUDO="sudo"
-else
-  SUDO=""
-  ok "Root права есть."
-fi
-
-# ─── 2. Проверка / установка Docker ─────────────────────────────────────────
-banner "Шаг 2/6: Docker"
-
-if command -v docker &>/dev/null; then
-  DOCKER_VER=$(docker --version | awk '{print $3}' | tr -d ',')
-  ok "Docker найден: ${DOCKER_VER}"
-else
-  warn "Docker не найден. Устанавливаю..."
-  curl -fsSL https://get.docker.com | sh
-  $SUDO systemctl enable --now docker
-  ok "Docker установлен."
-fi
-
-# Убеждаемся, что демон запущен
-if ! $SUDO docker info &>/dev/null; then
-  info "Запускаю docker daemon..."
-  $SUDO systemctl start docker
-fi
-
-# ─── 3. Определяем IP и настройку порта ─────────────────────────────────────
-banner "Шаг 3/6: Сеть"
-
-SERVER_IP=$(curl -4 -sf --max-time 10 https://api.ipify.org \
-         || curl -4 -sf --max-time 10 https://ifconfig.me \
-         || curl -4 -sf --max-time 10 https://icanhazip.com \
-         || echo "UNKNOWN")
-
-if [[ "$SERVER_IP" == "UNKNOWN" ]]; then
-  err "Не удалось определить внешний IP. Проверьте интернет."
-  exit 1
-fi
-ok "Внешний IP: ${BOLD}${SERVER_IP}${NC}"
-
-# Проверка занятости порта
-if $SUDO ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
-  warn "Порт ${PORT} уже занят! Освобождаю..."
-
-  # Останавливаем nginx/apache если мешают
-  for SVC in nginx apache2 httpd; do
-    if systemctl is-active --quiet "$SVC" 2>/dev/null; then
-      warn "Останавливаю ${SVC}..."
-      $SUDO systemctl stop "$SVC"
-      $SUDO systemctl disable "$SVC" 2>/dev/null || true
+  for cmd in docker curl openssl; do
+    if command -v "$cmd" &>/dev/null; then
+      ok "$cmd найден: $(command -v "$cmd")"
+    else
+      missing+=("$cmd")
+      warn "$cmd не найден"
     fi
   done
 
-  # Повторная проверка
-  sleep 1
-  if $SUDO ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
-    err "Порт ${PORT} всё ещё занят. Завершите процесс вручную:"
-    $SUDO ss -tlnp | grep ":${PORT} " || true
-    exit 1
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    error "Установите отсутствующие зависимости: ${missing[*]}"
   fi
-fi
-ok "Порт ${PORT} свободен."
 
-# ─── 4. Генерация FakeTLS-секрета ───────────────────────────────────────────
-banner "Шаг 4/6: Генерация FakeTLS-секрета"
-
-info "Домен маскировки: ${BOLD}${FAKE_DOMAIN}${NC}"
-info "Проверяю доступность домена..."
-
-# Проверяем, что домен резолвится и имеет HTTPS
-if ! curl -sf --max-time 5 "https://${FAKE_DOMAIN}" -o /dev/null; then
-  warn "Домен ${FAKE_DOMAIN} недоступен по HTTPS. Пробую www.cloudflare.com..."
-  FAKE_DOMAIN="www.cloudflare.com"
-  if ! curl -sf --max-time 5 "https://${FAKE_DOMAIN}" -o /dev/null; then
-    warn "Оба домена недоступны. Используем ${FAKE_DOMAIN} всё равно (сеть может быть ограничена)."
+  # Проверяем, что Docker daemon запущен
+  if ! docker info &>/dev/null; then
+    error "Docker daemon не запущен. Запустите: sudo systemctl start docker"
   fi
-fi
+  ok "Docker daemon активен"
+}
 
-info "Генерирую FakeTLS-секрет через mtg..."
+# ──────────────────────────────────────────────────────────────────────────────
+#  ОПРЕДЕЛЕНИЕ ПУБЛИЧНОГО IP
+# ──────────────────────────────────────────────────────────────────────────────
+detect_ip() {
+  header "Определение публичного IP"
 
-# Генерируем секрет с помощью самого образа mtg
-SECRET=$($SUDO docker run --rm "${IMAGE}" generate-secret --hex "${FAKE_DOMAIN}" 2>/dev/null)
+  local ip=""
+  local services=(
+    "https://api.ipify.org"
+    "https://ipecho.net/plain"
+    "https://checkip.amazonaws.com"
+    "https://ifconfig.me/ip"
+  )
 
-if [[ -z "$SECRET" ]]; then
-  err "Не удалось сгенерировать секрет через mtg. Генерирую вручную..."
-  # Fallback: вручную ee + 16 random bytes + hex(domain)
-  RAND_HEX=$(openssl rand -hex 16)
-  DOMAIN_HEX=$(printf '%s' "${FAKE_DOMAIN}" | od -An -tx1 | tr -d ' \n')
-  SECRET="ee${RAND_HEX}${DOMAIN_HEX}"
-fi
+  for svc in "${services[@]}"; do
+    log "Пробуем: $svc"
+    ip=$(curl -s --connect-timeout 5 "$svc" 2>/dev/null | tr -d '[:space:]') || true
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      ok "Публичный IP: ${BOLD}$ip${RESET}"
+      PUBLIC_IP="$ip"
+      return
+    fi
+  done
 
-ok "Секрет: ${BOLD}${SECRET}${NC}"
-info "Префикс 'ee' = FakeTLS режим включён ✅"
+  # Fallback — локальный IP
+  warn "Не удалось определить публичный IP, используем локальный"
+  ip=$(hostname -I | awk '{print $1}')
+  [[ -n "$ip" ]] || error "Не удалось определить IP-адрес сервера"
+  warn "Локальный IP: $ip (убедитесь что порт проброшен через NAT/firewall)"
+  PUBLIC_IP="$ip"
+}
 
-# ─── 5. Запуск контейнера ────────────────────────────────────────────────────
-banner "Шаг 5/6: Запуск MTProto-прокси"
+# ──────────────────────────────────────────────────────────────────────────────
+#  ВЫБОР ПОРТА
+# ──────────────────────────────────────────────────────────────────────────────
+choose_port() {
+  header "Настройка порта"
 
-# Удаляем старый контейнер, если есть
-if $SUDO docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-  warn "Найден старый контейнер ${CONTAINER_NAME}. Удаляю..."
-  $SUDO docker stop "${CONTAINER_NAME}" &>/dev/null || true
-  $SUDO docker rm   "${CONTAINER_NAME}" &>/dev/null || true
-fi
+  if [[ -n "$PROXY_PORT" ]]; then
+    log "Порт задан через переменную окружения: $PROXY_PORT"
+  else
+    echo -e "${YELLOW}Введите порт для MTProto прокси${RESET}"
+    echo -e "  Рекомендуется: ${BOLD}443${RESET} (HTTPS), ${BOLD}8443${RESET}, ${BOLD}2053${RESET}, или любой свободный"
+    read -rp "  Порт [по умолчанию: 443]: " input_port
+    PROXY_PORT="${input_port:-443}"
+  fi
 
-info "Запускаю контейнер..."
+  # Валидация
+  if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || (( PROXY_PORT < 1 || PROXY_PORT > 65535 )); then
+    error "Некорректный порт: $PROXY_PORT"
+  fi
 
-$SUDO docker run -d \
-  --name "${CONTAINER_NAME}" \
-  --restart unless-stopped \
-  --network host \
-  -p "${PORT}:${PORT}" \
-  "${IMAGE}" \
-  simple-run \
-    -n 1.1.1.1 \
-    -i prefer-ipv4 \
-    "0.0.0.0:${PORT}" \
-    "${SECRET}"
+  # Проверка занятости порта
+  if ss -tlnp 2>/dev/null | grep -q ":${PROXY_PORT} " || \
+     netstat -tlnp 2>/dev/null | grep -q ":${PROXY_PORT} "; then
+    warn "Порт $PROXY_PORT уже занят — убедитесь что конфликтов нет"
+  else
+    ok "Порт $PROXY_PORT свободен"
+  fi
+}
 
-# Ждём запуска
-info "Ожидаю запуска (5 сек)..."
-sleep 5
+# ──────────────────────────────────────────────────────────────────────────────
+#  ГЕНЕРАЦИЯ СЕКРЕТА
+# ──────────────────────────────────────────────────────────────────────────────
+generate_secret() {
+  header "Генерация секрета"
 
-# Проверка статуса
-if $SUDO docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-  ok "Контейнер запущен успешно!"
-else
-  err "Контейнер не запустился. Логи:"
-  $SUDO docker logs "${CONTAINER_NAME}" 2>&1 | tail -20
-  exit 1
-fi
+  if [[ -n "$SECRET" ]]; then
+    log "Секрет задан вручную"
+  else
+    SECRET=$(openssl rand -hex 16)
+    ok "Секрет сгенерирован автоматически"
+  fi
 
-# ─── 6. Итог и ссылка подключения ───────────────────────────────────────────
-banner "Шаг 6/6: Готово!"
+  # Для режима dd добавляем префикс
+  if [[ "$TAG" == "dd" ]]; then
+    FULL_SECRET="dd${SECRET}"
+    log "Режим: ${BOLD}dd (защита от DPI)${RESET}"
+  else
+    FULL_SECRET="$SECRET"
+    log "Режим: обычный"
+  fi
 
-TG_LINK="tg://proxy?server=${SERVER_IP}&port=${PORT}&secret=${SECRET}"
-HTTPS_LINK="https://t.me/proxy?server=${SERVER_IP}&port=${PORT}&secret=${SECRET}"
+  ok "Secret: ${BOLD}$SECRET${RESET}"
+}
 
-# Сохраняем конфиг
-cat > "${CONFIG_FILE}" << EOF
-# MTProto Proxy Config — $(date)
-SERVER=${SERVER_IP}
-PORT=${PORT}
-SECRET=${SECRET}
-DOMAIN=${FAKE_DOMAIN}
-TG_LINK=${TG_LINK}
-HTTPS_LINK=${HTTPS_LINK}
-EOF
+# ──────────────────────────────────────────────────────────────────────────────
+#  ОСТАНОВКА СТАРОГО КОНТЕЙНЕРА
+# ──────────────────────────────────────────────────────────────────────────────
+cleanup_old() {
+  header "Очистка старого контейнера"
 
-echo -e "${GREEN}${BOLD}"
-cat << 'SUCCESS'
-  ╔══════════════════════════════════════════╗
-  ║     ✅  ПРОКСИ УСПЕШНО ЗАПУЩЕН!         ║
-  ╚══════════════════════════════════════════╝
-SUCCESS
-echo -e "${NC}"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    warn "Найден контейнер '$CONTAINER_NAME' — останавливаем и удаляем..."
+    docker stop "$CONTAINER_NAME" &>/dev/null || true
+    docker rm   "$CONTAINER_NAME" &>/dev/null || true
+    ok "Старый контейнер удалён"
+  else
+    log "Старых контейнеров '$CONTAINER_NAME' не найдено"
+  fi
+}
 
-echo -e "  ${BOLD}🌐 Сервер:${NC}       ${SERVER_IP}"
-echo -e "  ${BOLD}🔌 Порт:${NC}         ${PORT}"
-echo -e "  ${BOLD}🔑 Секрет:${NC}       ${SECRET}"
-echo -e "  ${BOLD}🎭 Домен TLS:${NC}    ${FAKE_DOMAIN}"
-echo ""
-echo -e "  ${BOLD}${GREEN}🔗 Ссылка для Telegram:${NC}"
-echo -e "  ${CYAN}${TG_LINK}${NC}"
-echo ""
-echo -e "  ${BOLD}${GREEN}🌍 HTTPS-ссылка (браузер):${NC}"
-echo -e "  ${CYAN}${HTTPS_LINK}${NC}"
-echo ""
-echo -e "  ${YELLOW}📁 Конфиг сохранён:${NC} ${CONFIG_FILE}"
-echo ""
+# ──────────────────────────────────────────────────────────────────────────────
+#  ЗАПУСК КОНТЕЙНЕРА
+# ──────────────────────────────────────────────────────────────────────────────
+run_container() {
+  header "Запуск MTProto прокси"
 
-# QR-код инструкция
-echo -e "  ${BOLD}📱 Как подключиться:${NC}"
-echo -e "  1. Скопируйте ссылку выше"
-echo -e "  2. Откройте в браузере или Telegram"
-echo -e "  3. Telegram предложит добавить прокси → нажмите Применить"
-echo ""
+  log "Скачиваем образ: $IMAGE"
+  docker pull "$IMAGE"
 
-# ─── Управление ──────────────────────────────────────────────────────────────
-echo -e "${BOLD}${BLUE}═══ Управление ════════════════════════════════${NC}"
-echo -e "  ${BOLD}Статус:${NC}    docker ps | grep ${CONTAINER_NAME}"
-echo -e "  ${BOLD}Логи:${NC}      docker logs -f ${CONTAINER_NAME}"
-echo -e "  ${BOLD}Стоп:${NC}      docker stop ${CONTAINER_NAME}"
-echo -e "  ${BOLD}Рестарт:${NC}   docker restart ${CONTAINER_NAME}"
-echo -e "  ${BOLD}Удалить:${NC}   docker rm -f ${CONTAINER_NAME}"
-echo ""
+  log "Запускаем контейнер..."
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart "$RESTART_POLICY" \
+    -p "${PROXY_PORT}:443" \
+    -p "${STATS_PORT}:${STATS_PORT}" \
+    -v "${PWD}/mtproto-data:/data" \
+    -e SECRET="$SECRET" \
+    "$IMAGE"
 
-# ─── Статистика подключений (live) ───────────────────────────────────────────
-echo -e "${BOLD}${BLUE}═══ Текущая статистика ════════════════════════${NC}"
-CONN_COUNT=$($SUDO ss -tn 2>/dev/null | grep -c ":${PORT}" || echo "0")
-echo -e "  Активных соединений на порту ${PORT}: ${BOLD}${CONN_COUNT}${NC}"
-echo ""
+  ok "Контейнер запущен: ${BOLD}$CONTAINER_NAME${RESET}"
+}
 
-# ─── Проверка FakeTLS (openssl handshake) ────────────────────────────────────
-echo -e "${BOLD}${BLUE}═══ Проверка FakeTLS ══════════════════════════${NC}"
-info "Тестирую TLS-handshake (должен выглядеть как HTTPS)..."
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПРОВЕРКА РАБОТОСПОСОБНОСТИ
+# ──────────────────────────────────────────────────────────────────────────────
+health_check() {
+  header "Проверка состояния"
 
-if timeout 5 bash -c "echo | openssl s_client -connect ${SERVER_IP}:${PORT} -servername ${FAKE_DOMAIN} 2>&1" \
-    | grep -q "CONNECTED"; then
-  ok "FakeTLS работает — трафик выглядит как HTTPS ✅"
-else
-  warn "openssl тест не прошёл (это нормально на некоторых VPS — проверьте через Telegram)."
-fi
+  local retries=5
+  local delay=3
 
-echo ""
-echo -e "${GREEN}${BOLD}Всё готово! Прокси работает и замаскирован под HTTPS.${NC}"
-echo -e "${YELLOW}Для России рекомендуется порт 443 и домен крупного российского сайта.${NC}"
-echo ""
+  for ((i=1; i<=retries; i++)); do
+    local status
+    status=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
+    if [[ "$status" == "running" ]]; then
+      ok "Контейнер работает (статус: running)"
+      return
+    fi
+    log "Попытка $i/$retries — статус: $status, ждём ${delay}с..."
+    sleep "$delay"
+  done
+
+  warn "Контейнер не перешёл в статус running — проверьте логи:"
+  echo "  docker logs $CONTAINER_NAME"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ВЫВОД ИТОГОВОЙ ИНФОРМАЦИИ
+# ──────────────────────────────────────────────────────────────────────────────
+print_summary() {
+  local tg_link="https://t.me/proxy?server=${PUBLIC_IP}&port=${PROXY_PORT}&secret=${FULL_SECRET}"
+
+  echo ""
+  echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${GREEN}║              MTProto Proxy — готов к работе!                ║${RESET}"
+  echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Сервер:${RESET}       $PUBLIC_IP"
+  echo -e "  ${BOLD}Порт:${RESET}         $PROXY_PORT"
+  echo -e "  ${BOLD}Secret:${RESET}       $FULL_SECRET"
+  echo -e "  ${BOLD}Контейнер:${RESET}    $CONTAINER_NAME"
+  echo -e "  ${BOLD}Статистика:${RESET}   http://${PUBLIC_IP}:${STATS_PORT}/stats"
+  echo ""
+  echo -e "  ${BOLD}${CYAN}Ссылка для Telegram:${RESET}"
+  echo -e "  ${YELLOW}${tg_link}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Полезные команды:${RESET}"
+  echo -e "    docker logs -f $CONTAINER_NAME      # логи"
+  echo -e "    docker restart $CONTAINER_NAME      # перезапуск"
+  echo -e "    docker stop $CONTAINER_NAME         # остановка"
+  echo ""
+
+  # Сохраняем данные в файл
+  local info_file="mtproto-info.txt"
+  {
+    echo "MTProto Proxy Info"
+    echo "=================="
+    echo "Server:    $PUBLIC_IP"
+    echo "Port:      $PROXY_PORT"
+    echo "Secret:    $FULL_SECRET"
+    echo "TG Link:   $tg_link"
+    echo "Stats:     http://${PUBLIC_IP}:${STATS_PORT}/stats"
+    echo "Generated: $(date)"
+  } > "$info_file"
+  ok "Данные сохранены в: ${BOLD}${info_file}${RESET}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ТОЧКА ВХОДА
+# ──────────────────────────────────────────────────────────────────────────────
+main() {
+  echo -e "${BOLD}${CYAN}"
+  echo "  ███╗   ███╗████████╗██████╗ ██████╗  ██████╗ ████████╗ ██████╗ "
+  echo "  ████╗ ████║╚══██╔══╝██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝██╔═══██╗"
+  echo "  ██╔████╔██║   ██║   ██████╔╝██████╔╝██║   ██║   ██║   ██║   ██║"
+  echo "  ██║╚██╔╝██║   ██║   ██╔═══╝ ██╔══██╗██║   ██║   ██║   ██║   ██║"
+  echo "  ██║ ╚═╝ ██║   ██║   ██║     ██║  ██║╚██████╔╝   ██║   ╚██████╔╝"
+  echo "  ╚═╝     ╚═╝   ╚═╝   ╚═╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ "
+  echo -e "${RESET}"
+  echo -e "  ${BOLD}MTProto Proxy Docker Setup${RESET} — by auto-config script"
+  echo ""
+
+  check_deps
+  detect_ip
+  choose_port
+  generate_secret
+  cleanup_old
+  run_container
+  health_check
+  print_summary
+}
+
+main "$@"
