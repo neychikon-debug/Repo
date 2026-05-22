@@ -11,7 +11,7 @@ echo "[1] Создаю директорию для конфига..."
 mkdir -p $CONFIG_DIR
 
 echo "[2] Генерирую секрет..."
-SECRET=$(head -c 16 /dev/urandom | xxd -ps)
+SECRET=$(head -c 16 /dev/urandom | tr -dc 'a-f0-9' | head -c 32)
 FAKETLS_DOMAIN="www.cloudflare.com"
 
 echo "[3] Создаю config.json..."
@@ -35,6 +35,8 @@ docker run -d \
   -v $CONFIG_DIR:/data \
   $IMAGE
 
+SERVER_IP=$(curl -s ifconfig.me)
+
 echo ""
 echo "=========================================="
 echo " MTProto Proxy установлен и запущен!"
@@ -43,5 +45,5 @@ echo " FakeTLS: $FAKETLS_DOMAIN"
 echo " Secret: $SECRET"
 echo ""
 echo " Клиентская ссылка:"
-echo " tg://proxy?server=$(curl -s ifconfig.me)&port=443&secret=ee$SECRET"
+echo " tg://proxy?server=$SERVER_IP&port=443&secret=ee$SECRET"
 echo "=========================================="
