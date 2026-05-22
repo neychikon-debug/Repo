@@ -1,4 +1,4 @@
-MTProto FakeTLS Docker Installer (all-in-one)
+
 
 #!/usr/bin/env bash
 set -e
@@ -147,21 +147,3 @@ echo ""
 echo "Команда рестарта:"
 echo "mtproto-restart"
 echo ""
-
-Использование
-
-nano install_mtproto.sh
-
-Вставь содержимое.
-
-Далее:
-
-chmod +x install_mtproto.sh
-./install_mtproto.sh
-
-Что делает скрипт
-
-* Устанавливает Docker
-* Ставит MTProto Proxy
-* Включает FakeTLS
-* Открывает 443
