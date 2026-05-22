@@ -1,49 +1,49 @@
 #!/bin/bash
-
 set -e
 
-CONTAINER_NAME="mtproto"
-CONFIG_DIR="/opt/mtproto"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-IMAGE="telegrammessenger/proxy:latest"
+# ---------- Установка Docker (если отсутствует) ----------
+if ! command -v docker &> /dev/null; then
+    echo "Docker не найден. Устанавливаем..."
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker
+fi
 
-echo "[1] Создаю директорию для конфига..."
-mkdir -p $CONFIG_DIR
+# ---------- Настройка домена для fake‑TLS ----------
+read -p "Введите домен для поддельного TLS (по умолчанию: www.microsoft.com): " FAKE_DOMAIN
+FAKE_DOMAIN=${FAKE_DOMAIN:-www.microsoft.com}
 
-echo "[2] Генерирую секрет..."
-SECRET=$(head -c 16 /dev/urandom | tr -dc 'a-f0-9' | head -c 32)
-FAKETLS_DOMAIN="www.cloudflare.com"
+# ---------- Генерация секрета с префиксом dd ----------
+# Используем od вместо xxd, чтобы не зависеть от vim-common
+SECRET="dd$(echo -n "$FAKE_DOMAIN" | od -A n -t x1 | tr -d ' \n')"
 
-echo "[3] Создаю config.json..."
-cat > $CONFIG_FILE <<EOF
-{
-  "port": 443,
-  "secret": "$SECRET",
-  "tag": "",
-  "fake_tls_domain": "$FAKETLS_DOMAIN"
-}
-EOF
+# ---------- Рабочая директория для конфигурации ----------
+DATA_DIR="/opt/mtproto-proxy"
+mkdir -p "$DATA_DIR"
 
-echo "[4] Останавливаю старый контейнер (если есть)..."
-docker rm -f $CONTAINER_NAME 2>/dev/null || true
+# ---------- Определяем внешний IP ----------
+SERVER_IP=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || echo "YOUR_SERVER_IP")
 
-echo "[5] Запускаю MTProto Proxy в Docker..."
+# ---------- Удаляем старый контейнер, если есть ----------
+if docker ps -a --format '{{.Names}}' | grep -q "^mtproto-proxy$"; then
+    echo "Контейнер mtproto-proxy уже существует, удаляем..."
+    docker rm -f mtproto-proxy
+fi
+
+# ---------- Запуск прокси в Docker ----------
 docker run -d \
-  --name $CONTAINER_NAME \
-  --restart=always \
-  -p 443:443 \
-  -v $CONFIG_DIR:/data \
-  $IMAGE
-
-SERVER_IP=$(curl -s ifconfig.me)
+    --name mtproto-proxy \
+    --restart unless-stopped \
+    -p 443:443 \
+    -v "$DATA_DIR:/etc/telegram" \
+    -e SECRET="$SECRET" \
+    telegrammessenger/proxy:latest
 
 echo ""
-echo "=========================================="
-echo " MTProto Proxy установлен и запущен!"
-echo " Порт: 443"
-echo " FakeTLS: $FAKETLS_DOMAIN"
-echo " Secret: $SECRET"
+echo "=============================================="
+echo "MTProto‑прокси с Fake‑TLS успешно запущен!"
+echo "Ссылка для подключения (скопируйте в Telegram):"
+echo "https://t.me/proxy?server=${SERVER_IP}&port=443&secret=${SECRET}"
 echo ""
-echo " Клиентская ссылка:"
-echo " tg://proxy?server=$SERVER_IP&port=443&secret=ee$SECRET"
-echo "=========================================="
+echo "Конфигурация хранится в ${DATA_DIR} и будет автоматически"
+echo "загружена при перезапуске контейнера."
+echo "=============================================="
