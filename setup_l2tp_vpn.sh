@@ -1,86 +1,64 @@
+cat > /root/setup_l2tp_vpn.sh << 'SCRIPT'
 #!/usr/bin/env bash
-# =============================================================================
-#  L2TP/IPsec VPN Server — Auto Setup Script
-#  Поддерживаемые ОС: Ubuntu 20.04/22.04/24.04, Debian 10/11/12
-#  Запуск: sudo bash setup_l2tp_vpn.sh
-# =============================================================================
-
-set -euo pipefail
+set -uo pipefail
 IFS=$'\n\t'
 
-# ─── Цвета ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-# ─── Вспомогательные функции ──────────────────────────────────────────────────
 log()     { echo -e "${CYAN}[*]${RESET} $*"; }
 success() { echo -e "${GREEN}[✓]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
 error()   { echo -e "${RED}[✗]${RESET} $*" >&2; exit 1; }
-section() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}"; \
-            echo -e "${BOLD}${CYAN}  $*${RESET}"; \
+section() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo -e "${BOLD}${CYAN}  $*${RESET}"
             echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"; }
 
-# ─── Проверка прав ────────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && error "Скрипт необходимо запустить от root: sudo bash $0"
+[[ $EUID -ne 0 ]] && error "Запусти от root: sudo bash $0"
 
-# ─── Определение ОС ───────────────────────────────────────────────────────────
+gen_secret() {
+    local len="${1:-24}"
+    local result=""
+    while [[ ${#result} -lt $len ]]; do
+        result+=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9@#%^*_+' 2>/dev/null)
+    done
+    echo "${result:0:$len}"
+}
+
 detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        OS_ID="${ID}"
-        OS_VER="${VERSION_ID}"
-    else
-        error "Не удалось определить операционную систему."
-    fi
-
-    case "$OS_ID" in
-        ubuntu|debian) ;;
-        *) error "Поддерживаются только Ubuntu и Debian. Текущая ОС: $OS_ID" ;;
-    esac
+    [[ -f /etc/os-release ]] || error "Не удалось определить ОС."
+    source /etc/os-release
+    OS_ID="${ID}"; OS_VER="${VERSION_ID}"
+    case "$OS_ID" in ubuntu|debian) ;; *) error "Только Ubuntu/Debian. ОС: $OS_ID" ;; esac
     success "Обнаружена ОС: $PRETTY_NAME"
 }
 
-# ─── Определение внешнего IP ──────────────────────────────────────────────────
 get_public_ip() {
-    PUBLIC_IP=$(curl -4 -s --max-time 10 https://api.ipify.org \
-             || curl -4 -s --max-time 10 https://ifconfig.me \
-             || ip route get 1 | awk '{print $7; exit}')
-    [[ -z "$PUBLIC_IP" ]] && error "Не удалось определить публичный IP-адрес."
+    PUBLIC_IP=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || \
+                curl -4 -s --max-time 10 https://ifconfig.me 2>/dev/null || \
+                ip route get 1 | awk '{print $7; exit}')
+    [[ -z "$PUBLIC_IP" ]] && error "Не удалось определить публичный IP."
     success "Публичный IP: $PUBLIC_IP"
 }
 
-# ─── Генерация случайных строк ────────────────────────────────────────────────
-gen_secret() { head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9@#$%^&*_+' | head -c "${1:-24}" || true; }
-
-
-# ─── Запрос параметров у пользователя ────────────────────────────────────────
 prompt_config() {
     section "Конфигурация VPN"
 
-    # IPsec PSK
     DEFAULT_PSK=$(gen_secret 32)
     echo -e "${YELLOW}IPsec Pre-Shared Key${RESET} (Enter = случайный):"
     read -r -p "  PSK: " INPUT_PSK
     VPN_IPSEC_PSK="${INPUT_PSK:-$DEFAULT_PSK}"
 
-    # Пользователь
     echo -e "\n${YELLOW}VPN-пользователь${RESET} (Enter = 'vpnuser'):"
     read -r -p "  Логин: " INPUT_USER
     VPN_USER="${INPUT_USER:-vpnuser}"
 
-    # Пароль
     DEFAULT_PASS=$(gen_secret 20)
-    echo -e "\n${YELLOW}Пароль для пользователя '$VPN_USER'${RESET} (Enter = случайный):"
+    echo -e "\n${YELLOW}Пароль${RESET} (Enter = случайный):"
     read -r -p "  Пароль: " INPUT_PASS
     VPN_PASSWORD="${INPUT_PASS:-$DEFAULT_PASS}"
 
-    # IP-пул для клиентов
-    echo -e "\n${YELLOW}Подсеть для VPN-клиентов${RESET} (Enter = 192.168.42.0/24):"
+    echo -e "\n${YELLOW}Подсеть для клиентов${RESET} (Enter = 192.168.42.0/24):"
     read -r -p "  Подсеть: " INPUT_SUBNET
     VPN_SUBNET="${INPUT_SUBNET:-192.168.42.0/24}"
     VPN_LOCAL_IP=$(echo "$VPN_SUBNET" | sed 's|\.[0-9]*/.*|.1|')
@@ -88,45 +66,31 @@ prompt_config() {
     VPN_POOL_END=$(echo "$VPN_SUBNET" | sed 's|\.[0-9]*/.*|.200|')
 
     echo ""
-    warn "Внимание: DNS-трафик клиентов будет перенаправляться через 8.8.8.8 и 1.1.1.1"
+    warn "DNS клиентов → 8.8.8.8 и 1.1.1.1"
 }
 
-# ─── Установка пакетов ────────────────────────────────────────────────────────
 install_packages() {
     section "Установка пакетов"
-    log "Обновление индекса пакетов..."
+    log "apt-get update..."
     apt-get update -qq
-
-    log "Установка: xl2tpd, strongswan, ppp, iptables-persistent..."
+    log "Установка xl2tpd strongswan ppp iptables-persistent..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        xl2tpd \
-        strongswan \
-        strongswan-pki \
+        xl2tpd strongswan strongswan-pki \
         libstrongswan-standard-plugins \
-        ppp \
-        iptables-persistent \
-        net-tools \
-        curl \
-        2>/dev/null
-    success "Все пакеты установлены."
+        ppp iptables-persistent net-tools curl
+    success "Пакеты установлены."
 }
 
-# ─── Определение сетевого интерфейса ─────────────────────────────────────────
 detect_interface() {
     NET_IFACE=$(ip route get 1 2>/dev/null | awk '{print $5; exit}')
     [[ -z "$NET_IFACE" ]] && NET_IFACE=$(ip -o link show | awk -F': ' '$2 !~ "lo" {print $2; exit}')
-    success "Сетевой интерфейс: $NET_IFACE"
+    success "Интерфейс: $NET_IFACE"
 }
 
-# ─── Конфигурация IPsec (strongSwan) ─────────────────────────────────────────
 configure_ipsec() {
     section "Настройка IPsec / strongSwan"
-
-    # Резервная копия оригинального конфига
     [[ -f /etc/ipsec.conf ]] && cp /etc/ipsec.conf /etc/ipsec.conf.bak.$(date +%s)
-
     cat > /etc/ipsec.conf <<EOF
-# Сгенерировано setup_l2tp_vpn.sh — $(date)
 config setup
     charondebug="ike 1, knl 1, cfg 0"
     uniqueids=no
@@ -159,28 +123,17 @@ conn L2TP-PSK-noNAT
     dpdtimeout=120
     dpdaction=clear
 EOF
-
-    # IPsec PSK
-    cat > /etc/ipsec.secrets <<EOF
-# Сгенерировано setup_l2tp_vpn.sh — $(date)
-%any %any : PSK "${VPN_IPSEC_PSK}"
-EOF
-
+    printf '%%any %%any : PSK "%s"\n' "$VPN_IPSEC_PSK" > /etc/ipsec.secrets
     chmod 600 /etc/ipsec.secrets
     success "IPsec настроен."
 }
 
-# ─── Конфигурация xl2tpd ──────────────────────────────────────────────────────
 configure_xl2tpd() {
-    section "Настройка xl2tpd (L2TP)"
-
+    section "Настройка xl2tpd"
     mkdir -p /etc/xl2tpd
-
     cat > /etc/xl2tpd/xl2tpd.conf <<EOF
-; Сгенерировано setup_l2tp_vpn.sh — $(date)
 [global]
 ipsec saref = yes
-saref refinfo = 30
 
 [lns default]
 ip range = ${VPN_POOL_START}-${VPN_POOL_END}
@@ -193,16 +146,12 @@ ppp debug = no
 pppoptfile = /etc/ppp/options.xl2tpd
 length bit = yes
 EOF
-
     success "xl2tpd настроен."
 }
 
-# ─── Конфигурация PPP ─────────────────────────────────────────────────────────
 configure_ppp() {
     section "Настройка PPP"
-
     cat > /etc/ppp/options.xl2tpd <<EOF
-# Сгенерировано setup_l2tp_vpn.sh — $(date)
 ipcp-accept-local
 ipcp-accept-remote
 require-mschap-v2
@@ -214,7 +163,6 @@ crtscts
 lock
 hide-password
 modem
-debug
 name L2TP-VPN
 proxyarp
 lcp-echo-interval 30
@@ -223,27 +171,18 @@ mtu 1400
 mru 1400
 connect-delay 5000
 EOF
-
-    # Добавляем/обновляем пользователя в /etc/ppp/chap-secrets
-    # Формат: username  server  password  IP-addresses
     if grep -qE "^\"?${VPN_USER}\"?" /etc/ppp/chap-secrets 2>/dev/null; then
-        # Заменяем существующую запись
         sed -i "/^\"\\?${VPN_USER}\"\\?/d" /etc/ppp/chap-secrets
-        warn "Пользователь '${VPN_USER}' уже существовал — перезаписан."
+        warn "Пользователь '${VPN_USER}' перезаписан."
     fi
-
-    echo "\"${VPN_USER}\"  L2TP-VPN  \"${VPN_PASSWORD}\"  *" >> /etc/ppp/chap-secrets
+    printf '"%s"  L2TP-VPN  "%s"  *\n' "$VPN_USER" "$VPN_PASSWORD" >> /etc/ppp/chap-secrets
     chmod 600 /etc/ppp/chap-secrets
     success "PPP настроен. Пользователь '${VPN_USER}' добавлен."
 }
 
-# ─── Настройка ядра (IP forwarding) ──────────────────────────────────────────
 configure_kernel() {
-    section "Настройка параметров ядра"
-
-    SYSCTL_CONF="/etc/sysctl.d/99-vpn-l2tp.conf"
-    cat > "$SYSCTL_CONF" <<EOF
-# VPN L2TP/IPsec — setup_l2tp_vpn.sh
+    section "Параметры ядра"
+    cat > /etc/sysctl.d/99-vpn-l2tp.conf <<EOF
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
@@ -255,73 +194,45 @@ net.ipv4.conf.${NET_IFACE}.accept_redirects = 0
 net.ipv4.conf.${NET_IFACE}.send_redirects = 0
 net.ipv4.conf.${NET_IFACE}.rp_filter = 0
 EOF
-
-    sysctl -q -p "$SYSCTL_CONF"
-    success "IP-форвардинг и параметры ядра применены."
+    sysctl -q -p /etc/sysctl.d/99-vpn-l2tp.conf
+    success "IP-форвардинг включён."
 }
 
-# ─── Настройка iptables / NAT ─────────────────────────────────────────────────
 configure_iptables() {
     section "Настройка iptables / NAT"
-
-    # Сбрасываем старые правила для чистоты
-    iptables -F
-    iptables -t nat -F
-    iptables -t mangle -F
-
-    # Базовая политика
-    iptables -P INPUT   ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT  ACCEPT
-
-    # Разрешаем установленные соединения
+    iptables -F; iptables -t nat -F; iptables -t mangle -F
+    iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
     iptables -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
     iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    # Loopback
-    iptables -A INPUT -i lo -j ACCEPT
-
-    # SSH (защита от самоизоляции)
-    iptables -A INPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
-
-    # IPsec / L2TP порты
-    iptables -A INPUT -p udp --dport 500  -j ACCEPT   # IKE
-    iptables -A INPUT -p udp --dport 4500 -j ACCEPT   # NAT-T
-    iptables -A INPUT -p udp --dport 1701 -j ACCEPT   # L2TP
-    iptables -A INPUT -p 50  -j ACCEPT                # ESP
-    iptables -A INPUT -p 51  -j ACCEPT                # AH
-
-    # NAT — маскируем трафик VPN-клиентов
+    iptables -A INPUT  -i lo -j ACCEPT
+    iptables -A INPUT  -p tcp --dport 22 -m state --state NEW -j ACCEPT
+    iptables -A INPUT  -p udp --dport 500  -j ACCEPT
+    iptables -A INPUT  -p udp --dport 4500 -j ACCEPT
+    iptables -A INPUT  -p udp --dport 1701 -j ACCEPT
+    iptables -A INPUT  -p 50 -j ACCEPT
+    iptables -A INPUT  -p 51 -j ACCEPT
     iptables -t nat -A POSTROUTING -s "${VPN_SUBNET}" -o "${NET_IFACE}" -j MASQUERADE
-
-    # Forward для VPN-подсети
     iptables -A FORWARD -s "${VPN_SUBNET}" -j ACCEPT
     iptables -A FORWARD -d "${VPN_SUBNET}" -j ACCEPT
-
-    # Сохраняем правила
     netfilter-persistent save >/dev/null 2>&1
-    success "iptables настроены и сохранены."
+    success "iptables настроены."
 }
 
-# ─── Запуск и включение служб ────────────────────────────────────────────────
 start_services() {
     section "Запуск служб"
-
     for svc in strongswan-starter xl2tpd; do
         systemctl enable  "$svc" >/dev/null 2>&1 || true
         systemctl restart "$svc"
         if systemctl is-active --quiet "$svc"; then
             success "Служба '$svc' запущена."
         else
-            warn "Служба '$svc' не запустилась. Проверьте: journalctl -u $svc"
+            warn "'$svc' не запустилась. Проверь: journalctl -u $svc"
         fi
     done
 }
 
-# ─── Вывод итоговой информации ────────────────────────────────────────────────
 print_summary() {
     section "Готово! Данные для подключения"
-
     echo ""
     echo -e "  ${BOLD}Тип VPN:${RESET}       L2TP/IPsec с PSK"
     echo -e "  ${BOLD}Сервер:${RESET}        ${GREEN}${PUBLIC_IP}${RESET}"
@@ -329,38 +240,22 @@ print_summary() {
     echo -e "  ${BOLD}Пользователь:${RESET}  ${GREEN}${VPN_USER}${RESET}"
     echo -e "  ${BOLD}Пароль:${RESET}        ${GREEN}${VPN_PASSWORD}${RESET}"
     echo ""
-    echo -e "  ${YELLOW}Порты (открой в файрволе/облаке если нужно):${RESET}"
-    echo -e "    UDP 500   (IKE)"
-    echo -e "    UDP 4500  (NAT Traversal)"
-    echo -e "    UDP 1701  (L2TP)"
-    echo -e "    Протоколы ESP (50) и AH (51)"
-    echo ""
-    echo -e "  ${YELLOW}Управление пользователями:${RESET}"
-    echo -e "    Добавить пользователя: edit /etc/ppp/chap-secrets"
-    echo -e "    Формат строки: \"user\"  L2TP-VPN  \"password\"  *"
-    echo ""
-    echo -e "  ${YELLOW}Полезные команды:${RESET}"
-    echo -e "    Статус IPsec:   ${CYAN}ipsec statusall${RESET}"
-    echo -e "    Статус L2TP:    ${CYAN}systemctl status xl2tpd${RESET}"
-    echo -e "    Логи IPsec:     ${CYAN}journalctl -u strongswan-starter -f${RESET}"
-    echo -e "    Логи L2TP:      ${CYAN}journalctl -u xl2tpd -f${RESET}"
+    echo -e "  ${YELLOW}Порты:${RESET} UDP 500, UDP 4500, UDP 1701, ESP(50), AH(51)"
     echo ""
 
-    # Сохраняем credentials в файл
     CRED_FILE="/root/vpn-credentials.txt"
     cat > "$CRED_FILE" <<EOF
-=== L2TP/IPsec VPN Credentials ($(date)) ===
-Server IP:    ${PUBLIC_IP}
-IPsec PSK:    ${VPN_IPSEC_PSK}
-Username:     ${VPN_USER}
-Password:     ${VPN_PASSWORD}
-VPN Subnet:   ${VPN_SUBNET}
+=== L2TP/IPsec VPN ($(date)) ===
+Server:   ${PUBLIC_IP}
+PSK:      ${VPN_IPSEC_PSK}
+User:     ${VPN_USER}
+Password: ${VPN_PASSWORD}
+Subnet:   ${VPN_SUBNET}
 EOF
     chmod 600 "$CRED_FILE"
-    success "Credentials сохранены в ${CRED_FILE} (chmod 600)"
+    success "Credentials → ${CRED_FILE}"
 }
 
-# ─── Точка входа ──────────────────────────────────────────────────────────────
 main() {
     clear
     echo -e "${BOLD}${CYAN}"
@@ -373,7 +268,6 @@ main() {
     echo -e "${RESET}"
     echo -e "  ${BOLD}L2TP/IPsec VPN Server Setup${RESET}  |  Ubuntu/Debian"
     echo ""
-
     detect_os
     get_public_ip
     prompt_config
@@ -389,4 +283,6 @@ main() {
 }
 
 main "$@"
+SCRIPT
 
+chmod +x /root/setup_l2tp_vpn.sh && bash /root/setup_l2tp_vpn.sh
